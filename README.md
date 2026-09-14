@@ -1,26 +1,26 @@
 # atome
 
-Un module TON618 — tenseurs, autodiff (rétropropagation), couches, optimiseurs (SGD + Adam), perte de classification, tokenizer, et sauvegarde/chargement de modèles (`.atm`). C'est un module comme un autre — installable, pas une fonctionnalité intégrée du langage.
+A TON618 module — tensors, autodiff (backpropagation), layers, optimizers (SGD + Adam), classification loss, tokenizer, and model save/load (`.atm`). It's a module like any other — installable, not a built-in language feature.
 
-**Nécessite `ton618` beta-1.0.7 ou plus récent.** Depuis beta-1.0.6, l'interpréteur fournit un module natif `ton.tensor` (boucles réelles en C++), et `atome` s'appuie dessus pour toutes ses opérations de calcul intensif — gain mesuré de **5 à 16x** sur les exemples fournis, sans aucun changement à l'API publique du module. Beta-1.0.7 ajoute `tensor_conv1d`/`tensor_argmax`, utilisés par la nouvelle couche **Conv1D** et `atome_predict_class`. Vérifie avec `ton618 --version` ; mets à jour avec `ton618 --update` si besoin.
+**Requires `ton618` beta-1.0.7 or newer.** Since beta-1.0.6, the interpreter ships a native `ton.tensor` module (real C++ loops), and `atome` relies on it for all its compute-intensive operations — a measured **5 to 16x** speedup on the provided examples, with no change to the module's public API. Beta-1.0.7 adds `tensor_conv1d`/`tensor_argmax`, used by the new **Conv1D** layer and `atome_predict_class`. Check with `ton618 --version`; update with `ton618 --update` if needed.
 
-**Nouveau dans cette version d'`atome`** : couche **Conv1D** (vérifiée par un test de gradient numérique *et* un entraînement réel — voir `examples/gradient_check.ton` et `examples/train_conv1d.ton`), couche **Dropout** avec mode entraînement/évaluation, et `atome_predict_class` pour lire directement la classe prédite.
+**New in this version of `atome`**: **Conv1D** layer (verified with both a numerical gradient check *and* real training — see `examples/gradient_check.ton` and `examples/train_conv1d.ton`), **Dropout** layer with train/eval mode, and `atome_predict_class` to read the predicted class directly.
 
-**Toute la doc complète est dans [`DOCUMENTATION.md`](DOCUMENTATION.md)** — API complète, correspondance avec PyTorch, limites honnêtes, et comment tout ça a été vérifié.
+**The full documentation is in [`DOCUMENTATION.md`](DOCUMENTATION.md)** — complete API, PyTorch mapping, honest limitations, and how all of this was verified.
 
 ## Installation
 
 ```bash
-ton618 install atome        # une fois publié dans le registre TON618
+ton618 install atome        # once published to the TON618 registry
 ```
 
-Ou, en attendant, copie simplement `atome.ton` dans le dossier `modules/` de ton projet, puis :
+Or, in the meantime, just copy `atome.ton` into your project's `modules/` folder, then:
 
 ```
 IMPORT://atome
 ```
 
-## Démarrage rapide
+## Quick start
 
 ```
 IMPORT://atome
@@ -49,15 +49,15 @@ for ton.int epoch = 0; epoch < 2000; epoch++ {
 }
 
 print(atome_tensor_to_array(atome_forward(model, atome_node(X))["data"]))
-// -> environ [[~0], [~1], [~1], [~0]]
+// -> roughly [[~0], [~1], [~1], [~0]]
 ```
 
-Quatre scripts complets et testés dans `examples/` :
-- `train_xor.ton` — régression/classification binaire (le script ci-dessus)
-- `train_classifier.ton` — classification multi-classes avec softmax + cross-entropy + Adam
-- `save_load.ton` — sauvegarder puis recharger un modèle `.atm`
-- `tokenizer.ton` — tokenisation mot-par-mot
+Four complete, tested scripts in `examples/`:
+- `train_xor.ton` — binary regression/classification (the script above)
+- `train_classifier.ton` — multi-class classification with softmax + cross-entropy + Adam
+- `save_load.ton` — save then reload an `.atm` model
+- `tokenizer.ton` — word-by-word tokenization
 
-## En une phrase sur les limites
+## Limitations in one sentence
 
-CPU uniquement (aucun backend GPU n'existe dans TON618), tenseurs 1D/2D seulement, pas de diffusion (broadcasting) façon NumPy au-delà d'un scalaire, et c'est lent (boucles TON618 interprétées, pas de vectorisation). Voir [`DOCUMENTATION.md`](DOCUMENTATION.md) pour le détail complet et pourquoi.
+CPU only (no GPU backend exists in TON618), 1D/2D tensors only, no NumPy-style broadcasting beyond a scalar, and it's slow (interpreted TON618 loops, no vectorization). See [`DOCUMENTATION.md`](DOCUMENTATION.md) for the full details and why.
