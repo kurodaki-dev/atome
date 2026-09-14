@@ -1,5 +1,7 @@
 # atome — full documentation
 
+*[Lire en français](DOCUMENTATION.fr.md)*
+
 ### Table of contents
 1. [What it is, and what it isn't](#what-it-is-and-what-it-isnt)
 2. [Installation](#installation)

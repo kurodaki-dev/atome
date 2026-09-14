@@ -1,5 +1,7 @@
 # atome
 
+*[Lire en français](README.fr.md)*
+
 A TON618 module — tensors, autodiff (backpropagation), layers, optimizers (SGD + Adam), classification loss, tokenizer, and model save/load (`.atm`). It's a module like any other — installable, not a built-in language feature.
 
 **Requires `ton618` beta-1.0.7 or newer.** Since beta-1.0.6, the interpreter ships a native `ton.tensor` module (real C++ loops), and `atome` relies on it for all its compute-intensive operations — a measured **5 to 16x** speedup on the provided examples, with no change to the module's public API. Beta-1.0.7 adds `tensor_conv1d`/`tensor_argmax`, used by the new **Conv1D** layer and `atome_predict_class`. Check with `ton618 --version`; update with `ton618 --update` if needed.
