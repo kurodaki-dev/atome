@@ -1,0 +1,52 @@
+IMPORT://atome
+IMPORT://ton.random
+
+random_seed(42)
+
+ton.dict X = atome_tensor_from_array([[0, 0], [0, 1], [1, 0], [1, 1]])
+ton.dict Y = atome_tensor_from_array([[0], [1], [1], [0]])
+
+ton.dict model = atome_sequential([
+    atome_dense(2, 8),
+    atome_tanh_layer(),
+    atome_dense(8, 1),
+    atome_sigmoid_layer()
+])
+
+ton.array params = atome_params(model)
+
+ton.function xNodeFor(data) {
+    return atome_node(data)
+}
+
+ton.float lr = 0.5
+ton.int epochs = 2000
+
+for ton.int epoch = 0; epoch < epochs; epoch++ {
+    atome_zero_grads(params)
+    ton.dict xNode = xNodeFor(X)
+    ton.dict pred = atome_forward(model, xNode)
+    ton.dict loss = atome_mse_loss(pred, Y)
+    atome_backward(loss)
+    atome_sgd_step(params, lr)
+
+    if epoch % 400 == 0 {
+        print("epoch " + str(epoch) + " loss=" + str(loss["data"]["data"][0]))
+    }
+}
+
+ton.dict finalPred = atome_forward(model, atome_node(X))
+ton.array predArr = atome_tensor_to_array(finalPred["data"])
+print("predictions:")
+print(predArr)
+print("expected: [[0],[1],[1],[0]]")
+
+// sanity: predictions should be closer to their targets than to the opposite
+ton.array flatTargets = [0, 1, 1, 0]
+ton.int correct = 0
+for ton.int i = 0; i < 4; i++ {
+    ton.float p = predArr[i][0]
+    ton.int rounded = p > 0.5 ? 1 : 0
+    if rounded == flatTargets[i] { correct += 1 }
+}
+print("correct: " + str(correct) + "/4")

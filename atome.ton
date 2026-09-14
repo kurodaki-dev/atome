@@ -1,0 +1,620 @@
+// atome.ton — a from-scratch, pure-TON618 tensors + autograd + neural
+// network module. No C++/interpreter changes needed: everything here is
+// plain TON618, installable like any other module (`ton618 install atome`
+// once published, or just drop this file in your project's modules/ folder
+// and `IMPORT://atome`).
+//
+// HONEST LIMITS — read this before building anything ambitious:
+//   - CPU only. There is no GPU backend to reach from TON618 — atome_set_device
+//     accepts "gpu" but always actually runs on CPU (see below).
+//   - 1D and 2D tensors only (vectors and matrices) — no 3D+ tensors.
+//   - No broadcasting beyond a scalar, except the one explicit exception
+//     (atome_add_bias) used by Dense layers.
+//   - This is a real, from-scratch reverse-mode autodiff engine (same idea
+//     as micrograd), not a reimplementation of PyTorch. It is slow compared
+//     to a compiled numeric library — every scalar op is an interpreted
+//     TON618 loop — fine for small models and learning, not for real-scale
+//     training.
+//
+// Naming convention: every exported name is prefixed "atome_" (module
+// guide convention — see DOCUMENTATION.md > "Creating a TON618 module").
+// Names starting "atome__" (double underscore) are internal helpers.
+
+IMPORT://ton.mathutils
+IMPORT://ton.json
+
+// =============================================================================
+// Device (honest stub — see HONEST LIMITS above)
+// =============================================================================
+
+ton.string atome__device = "cpu"
+
+ton.function atome_set_device(name) {
+    if name == "gpu" {
+        print("[atome] Warning: TON618 has no GPU compute backend (no CUDA/OpenCL bindings) - running on CPU regardless of this setting.")
+        atome__device = "cpu"
+        return atome__device
+    }
+    if name != "cpu" {
+        throw "atome_set_device: unknown device '" + name + "' (only 'cpu' is real; 'gpu' is accepted but always falls back to cpu)"
+    }
+    atome__device = "cpu"
+    return atome__device
+}
+
+ton.function atome_get_device() {
+    return atome__device
+}
+
+// =============================================================================
+// Low-level tensor: a ton.dict {shape: [..], data: [..]} (data is flat,
+// row-major). Works for 1D (shape has 1 entry) and 2D (shape has 2 entries).
+//
+// Since ton618 beta-1.0.6, the interpreter ships a native `ton.tensor`
+// module using this exact same {shape, data} representation, with every hot
+// loop (element-wise ops, matmul, activations, reductions) implemented as a
+// real C++ loop instead of an interpreted TON618 one. Everything below is a
+// thin wrapper over it, so atome's own public API (atome_tensor_*) never
+// changes — only what runs underneath does. Requires ton618 beta-1.0.6+; on
+// an older interpreter, `IMPORT://ton.tensor` fails with a clear
+// "unknown built-in module" error rather than something confusing.
+// =============================================================================
+
+IMPORT://ton.tensor
+
+ton.function atome_tensor_size(shape) {
+    ton.int n = 1
+    for ton.d in shape { n *= d }
+    return n
+}
+
+ton.function atome_tensor_zeros(shape) { return tensor_zeros(shape) }
+ton.function atome_tensor_ones(shape) { return tensor_ones(shape) }
+ton.function atome_tensor_full(shape, value) { return tensor_full(shape, value) }
+ton.function atome_tensor_random(shape, lo, hi) { return tensor_random(shape, lo, hi) }
+
+ton.function atome_flat_index(shape, indices) {
+    if len(shape) == 1 { return indices[0] }
+    return indices[0] * shape[1] + indices[1]
+}
+ton.function atome_tensor_get(t, indices) { return tensor_get(t, indices) }
+ton.function atome_tensor_set(t, indices, value) { return tensor_set(t, indices, value) }
+ton.function atome_tensor_clone(t) { return tensor_clone(t) }
+ton.function atome_tensor_reshape(t, newShape) { return tensor_reshape(t, newShape) }
+ton.function atome_tensor_from_array(arr) { return tensor_from_array(arr) }
+ton.function atome_tensor_to_array(t) { return tensor_to_array(t) }
+
+// Element-wise: either side may be a plain number (scalar broadcast), but
+// two tensors must have the exact same shape — no NumPy-style broadcasting
+// between differently-shaped tensors.
+ton.function atome_tensor_add(a, b) { return tensor_add(a, b) }
+ton.function atome_tensor_sub(a, b) { return tensor_sub(a, b) }
+ton.function atome_tensor_mul(a, b) { return tensor_mul(a, b) }
+ton.function atome_tensor_div(a, b) { return tensor_div(a, b) }
+
+// One explicit, documented exception to "no broadcasting": adding a 1D bias
+// vector to every row of a 2D matrix — exactly what a Dense layer needs.
+ton.function atome_tensor_add_bias(mat, bias) { return tensor_add_bias(mat, bias) }
+
+ton.function atome_tensor_matmul(a, b) { return tensor_matmul(a, b) }
+ton.function atome_tensor_transpose(t) { return tensor_transpose(t) }
+ton.function atome_tensor_sum(t) { return tensor_sum(t) }
+ton.function atome_tensor_mean(t) { return tensor_mean(t) }
+ton.function atome_tensor_max(t) { return tensor_max(t) }
+ton.function atome_tensor_min(t) { return tensor_min(t) }
+ton.function atome_tensor_map(t, fn) { return tensor_map(t, fn) }
+ton.function atome_tensor_relu(t) { return tensor_relu(t) }
+ton.function atome_tensor_sigmoid(t) { return tensor_sigmoid(t) }
+ton.function atome_tensor_tanh(t) { return tensor_tanh(t) }
+ton.function atome_tensor_softmax(t) { return tensor_softmax(t) }
+
+// Native gradient helpers (see ton.tensor's own docs for the exact
+// input/output convention) — used by the autograd section below instead of
+// hand-rolling the same elementwise loop in TON618.
+ton.function atome_tensor_relu_grad(input) { return tensor_relu_grad(input) }
+ton.function atome_tensor_sigmoid_grad(output) { return tensor_sigmoid_grad(output) }
+ton.function atome_tensor_tanh_grad(output) { return tensor_tanh_grad(output) }
+
+// =============================================================================
+// Autograd — a from-scratch reverse-mode autodiff engine (same idea as
+// "micrograd"), built entirely out of the tensor ops above. A Node wraps a
+// tensor with a gradient accumulator and a "backward" closure recorded at
+// the moment the op that produced it ran.
+// =============================================================================
+
+ton.int atome__node_counter = 0
+
+ton.function atome_node(data) {
+    atome__node_counter += 1
+    return {
+        id: atome__node_counter,
+        data: data,
+        grad: atome_tensor_zeros(data["shape"]),
+        parents: [],
+        backward: ton.function(self) { },
+        op: "leaf"
+    }
+}
+
+ton.function atome_zero_grad(node) {
+    node["grad"] = atome_tensor_zeros(node["data"]["shape"])
+}
+
+ton.function atome__topo_sort(node, visited, order) {
+    ton.string key = str(node["id"])
+    if has(visited, key) { return }
+    visited[key] = true
+    for ton.p in node["parents"] { atome__topo_sort(p, visited, order) }
+    push(order, node)
+}
+
+// Runs backprop from lossNode (seeding its own gradient with 1s) through
+// every ancestor, in reverse topological order.
+ton.function atome_backward(lossNode) {
+    lossNode["grad"] = atome_tensor_ones(lossNode["data"]["shape"])
+    ton.dict visited = {}
+    ton.array order = []
+    atome__topo_sort(lossNode, visited, order)
+    for ton.int i = len(order) - 1; i >= 0; i-- {
+        ton.dict node = order[i]
+        node["backward"](node)
+    }
+}
+
+ton.function atome_add(a, b) {
+    ton.dict out = atome_node(atome_tensor_add(a["data"], b["data"]))
+    out["parents"] = [a, b]
+    out["op"] = "add"
+    out["backward"] = ton.function(self) {
+        a["grad"] = atome_tensor_add(a["grad"], self["grad"])
+        b["grad"] = atome_tensor_add(b["grad"], self["grad"])
+    }
+    return out
+}
+
+ton.function atome_mul(a, b) {
+    ton.dict out = atome_node(atome_tensor_mul(a["data"], b["data"]))
+    out["parents"] = [a, b]
+    out["op"] = "mul"
+    out["backward"] = ton.function(self) {
+        a["grad"] = atome_tensor_add(a["grad"], atome_tensor_mul(self["grad"], b["data"]))
+        b["grad"] = atome_tensor_add(b["grad"], atome_tensor_mul(self["grad"], a["data"]))
+    }
+    return out
+}
+
+ton.function atome_add_bias(matNode, biasNode) {
+    ton.dict out = atome_node(atome_tensor_add_bias(matNode["data"], biasNode["data"]))
+    out["parents"] = [matNode, biasNode]
+    out["op"] = "add_bias"
+    out["backward"] = ton.function(self) {
+        matNode["grad"] = atome_tensor_add(matNode["grad"], self["grad"])
+        ton.array shape = self["data"]["shape"]
+        ton.int rows = shape[0]
+        ton.int cols = shape[1]
+        ton.array g = self["grad"]["data"]
+        ton.array biasGrad = []
+        for ton.int c = 0; c < cols; c++ { push(biasGrad, 0) }
+        for ton.int r = 0; r < rows; r++ {
+            for ton.int c = 0; c < cols; c++ { biasGrad[c] += g[r * cols + c] }
+        }
+        biasNode["grad"] = atome_tensor_add(biasNode["grad"], {shape: [cols], data: biasGrad})
+    }
+    return out
+}
+
+ton.function atome_matmul(a, b) {
+    ton.dict out = atome_node(atome_tensor_matmul(a["data"], b["data"]))
+    out["parents"] = [a, b]
+    out["op"] = "matmul"
+    out["backward"] = ton.function(self) {
+        ton.dict bT = atome_tensor_transpose(b["data"])
+        ton.dict aT = atome_tensor_transpose(a["data"])
+        a["grad"] = atome_tensor_add(a["grad"], atome_tensor_matmul(self["grad"], bT))
+        b["grad"] = atome_tensor_add(b["grad"], atome_tensor_matmul(aT, self["grad"]))
+    }
+    return out
+}
+
+ton.function atome_relu(a) {
+    ton.dict outData = atome_tensor_relu(a["data"])
+    ton.dict out = atome_node(outData)
+    out["parents"] = [a]
+    out["op"] = "relu"
+    out["backward"] = ton.function(self) {
+        ton.dict localGrad = atome_tensor_mul(atome_tensor_relu_grad(a["data"]), self["grad"])
+        a["grad"] = atome_tensor_add(a["grad"], localGrad)
+    }
+    return out
+}
+
+ton.function atome_sigmoid(a) {
+    ton.dict outData = atome_tensor_sigmoid(a["data"])
+    ton.dict out = atome_node(outData)
+    out["parents"] = [a]
+    out["op"] = "sigmoid"
+    out["backward"] = ton.function(self) {
+        ton.dict localGrad = atome_tensor_mul(atome_tensor_sigmoid_grad(outData), self["grad"])
+        a["grad"] = atome_tensor_add(a["grad"], localGrad)
+    }
+    return out
+}
+
+ton.function atome_tanh(a) {
+    ton.dict outData = atome_tensor_tanh(a["data"])
+    ton.dict out = atome_node(outData)
+    out["parents"] = [a]
+    out["op"] = "tanh"
+    out["backward"] = ton.function(self) {
+        ton.dict localGrad = atome_tensor_mul(atome_tensor_tanh_grad(outData), self["grad"])
+        a["grad"] = atome_tensor_add(a["grad"], localGrad)
+    }
+    return out
+}
+
+// Mean-squared-error loss. predNode.data and targetTensor must be the same shape.
+ton.function atome_mse_loss(predNode, targetTensor) {
+    ton.dict diff = atome_tensor_sub(predNode["data"], targetTensor)
+    ton.array dd = diff["data"]
+    ton.float s = 0
+    for ton.v in dd { s += v * v }
+    ton.float n = len(dd)
+    ton.dict lossNode = atome_node({shape: [1], data: [s / n]})
+    lossNode["parents"] = [predNode]
+    lossNode["op"] = "mse_loss"
+    lossNode["backward"] = ton.function(self) {
+        ton.float gradOut = self["grad"]["data"][0]
+        ton.array gradVals = []
+        for ton.v in dd { push(gradVals, 2 * v / n * gradOut) }
+        predNode["grad"] = atome_tensor_add(predNode["grad"], {shape: predNode["data"]["shape"], data: gradVals})
+    }
+    return lossNode
+}
+
+// One-hot encodes an array of integer class labels into a [n, numClasses] tensor.
+ton.function atome_one_hot(labels, numClasses) {
+    ton.int n = len(labels)
+    ton.array data = []
+    for ton.int i = 0; i < n * numClasses; i++ { push(data, 0) }
+    for ton.int i = 0; i < n; i++ { data[i * numClasses + labels[i]] = 1 }
+    return {shape: [n, numClasses], data: data}
+}
+
+// Softmax + cross-entropy, fused into one Node for classification. Takes raw
+// logits (not already softmax'd) and a one-hot target tensor (see
+// atome_one_hot) of the same shape. The combined gradient of softmax+CE
+// w.r.t. the logits is just (softmax(logits) - target)/batch — the standard
+// trick that avoids the two ops' gradients being chained (and the numerical
+// instability of differentiating log(softmax(x)) directly).
+ton.function atome_softmax_cross_entropy_loss(logitsNode, targetOneHot) {
+    ton.dict probs = atome_tensor_softmax(logitsNode["data"])
+    ton.array pd = probs["data"]
+    ton.array td = targetOneHot["data"]
+    ton.array shape = logitsNode["data"]["shape"]
+    ton.int batch = len(shape) == 2 ? shape[0] : 1
+    ton.float eps = 0.0000001
+    ton.float total = 0
+    for ton.int i = 0; i < len(pd); i++ { total += -td[i] * mathutils_log(pd[i] + eps) }
+    ton.float lossVal = total / batch
+
+    ton.dict lossNode = atome_node({shape: [1], data: [lossVal]})
+    lossNode["parents"] = [logitsNode]
+    lossNode["op"] = "softmax_cross_entropy"
+    lossNode["backward"] = ton.function(self) {
+        ton.float gradOut = self["grad"]["data"][0]
+        ton.array gradVals = []
+        for ton.int i = 0; i < len(pd); i++ { push(gradVals, (pd[i] - td[i]) / batch * gradOut) }
+        logitsNode["grad"] = atome_tensor_add(logitsNode["grad"], {shape: shape, data: gradVals})
+    }
+    return lossNode
+}
+
+// =============================================================================
+// Layers and a simple Sequential model
+// =============================================================================
+
+ton.function atome_dense(inFeatures, outFeatures) {
+    ton.float scale = 1 / sqrt(inFeatures)
+    ton.array wRows = []
+    for ton.int i = 0; i < inFeatures; i++ {
+        ton.array row = []
+        for ton.int j = 0; j < outFeatures; j++ { push(row, (random() * 2 - 1) * scale) }
+        push(wRows, row)
+    }
+    ton.dict wNode = atome_node(atome_tensor_from_array(wRows))
+    ton.array bArr = []
+    for ton.int j = 0; j < outFeatures; j++ { push(bArr, 0) }
+    ton.dict bNode = atome_node({shape: [outFeatures], data: bArr})
+    return {type: "dense", W: wNode, b: bNode}
+}
+
+ton.function atome_dense_forward(layer, xNode) {
+    return atome_add_bias(atome_matmul(xNode, layer["W"]), layer["b"])
+}
+
+// Conv1D — single input channel, single output channel (no multi-channel
+// support — see the README/DOCUMENTATION for why that's the honest scope
+// here). Wraps the native tensor_conv1d primitive with a hand-derived,
+// numerically-verified backward pass (see examples/gradient_check.ton).
+ton.function atome_conv1d(kernelSize, stride) {
+    ton.float scale = 1 / sqrt(kernelSize)
+    ton.array kArr = []
+    for ton.int i = 0; i < kernelSize; i++ { push(kArr, (random() * 2 - 1) * scale) }
+    ton.dict kNode = atome_node({shape: [kernelSize], data: kArr})
+    ton.dict bNode = atome_node({shape: [1], data: [0]})
+    return {type: "conv1d", K: kNode, b: bNode, kernelSize: kernelSize, stride: stride}
+}
+
+ton.function atome_conv1d_forward(layer, xNode) {
+    ton.int stride = layer["stride"]
+    ton.dict kernel = layer["K"]
+    ton.dict bias = layer["b"]
+    ton.dict outData = tensor_conv1d(xNode["data"], kernel["data"], stride)
+    ton.float biasVal = bias["data"]["data"][0]
+    ton.array biased = []
+    for ton.v in outData["data"] { push(biased, v + biasVal) }
+
+    ton.dict out = atome_node({shape: outData["shape"], data: biased})
+    out["parents"] = [xNode, kernel, bias]
+    out["op"] = "conv1d"
+    out["backward"] = ton.function(self) {
+        ton.array gradOut = self["grad"]["data"]
+        ton.array signal = xNode["data"]["data"]
+        ton.array kernelData = kernel["data"]["data"]
+        ton.int K = layer["kernelSize"]
+        ton.array dK = []
+        for ton.int j = 0; j < K; j++ { push(dK, 0) }
+        ton.array dSignal = []
+        for ton.int i = 0; i < len(signal); i++ { push(dSignal, 0) }
+        for ton.int i = 0; i < len(gradOut); i++ {
+            ton.int base = i * stride
+            ton.float g = gradOut[i]
+            for ton.int j = 0; j < K; j++ {
+                dK[j] += g * signal[base + j]
+                dSignal[base + j] += g * kernelData[j]
+            }
+        }
+        ton.float dBias = 0
+        for ton.v in gradOut { dBias += v }
+        xNode["grad"] = atome_tensor_add(xNode["grad"], {shape: xNode["data"]["shape"], data: dSignal})
+        kernel["grad"] = atome_tensor_add(kernel["grad"], {shape: kernel["data"]["shape"], data: dK})
+        bias["grad"] = atome_tensor_add(bias["grad"], {shape: [1], data: [dBias]})
+    }
+    return out
+}
+
+ton.function atome_relu_layer() { return {type: "relu"} }
+ton.function atome_sigmoid_layer() { return {type: "sigmoid"} }
+ton.function atome_tanh_layer() { return {type: "tanh"} }
+
+// Train/eval mode — dropout is the only layer that behaves differently
+// between the two (identity at eval time). Defaults to training.
+ton.bool atome__training = true
+ton.function atome_set_training(isTraining) { atome__training = isTraining }
+ton.function atome_is_training() { return atome__training }
+
+// Inverted dropout: zeroes each element with probability p during training
+// and scales survivors by 1/(1-p) so no rescaling is needed at eval time,
+// where this layer is simply the identity.
+ton.function atome_dropout_layer(p) { return {type: "dropout", p: p} }
+
+ton.function atome_dropout_forward(layer, xNode) {
+    if !atome__training { return xNode }
+    ton.float p = layer["p"]
+    ton.float scale = 1 / (1 - p)
+    ton.array xd = xNode["data"]["data"]
+    ton.array mask = []
+    for ton.int i = 0; i < len(xd); i++ { push(mask, random() < p ? 0 : scale) }
+    ton.array outArr = []
+    for ton.int i = 0; i < len(xd); i++ { push(outArr, xd[i] * mask[i]) }
+
+    ton.dict out = atome_node({shape: xNode["data"]["shape"], data: outArr})
+    out["parents"] = [xNode]
+    out["op"] = "dropout"
+    out["backward"] = ton.function(self) {
+        ton.array gradOut = self["grad"]["data"]
+        ton.array dSignal = []
+        for ton.int i = 0; i < len(gradOut); i++ { push(dSignal, gradOut[i] * mask[i]) }
+        xNode["grad"] = atome_tensor_add(xNode["grad"], {shape: xNode["data"]["shape"], data: dSignal})
+    }
+    return out
+}
+
+ton.function atome_sequential(layers) {
+    return {type: "sequential", layers: layers}
+}
+
+ton.function atome_forward(model, xNode) {
+    ton.dict h = xNode
+    for ton.layer in model["layers"] {
+        ton.string t = layer["type"]
+        if t == "dense" { h = atome_dense_forward(layer, h) }
+        else if t == "conv1d" { h = atome_conv1d_forward(layer, h) }
+        else if t == "dropout" { h = atome_dropout_forward(layer, h) }
+        else if t == "relu" { h = atome_relu(h) }
+        else if t == "sigmoid" { h = atome_sigmoid(h) }
+        else if t == "tanh" { h = atome_tanh(h) }
+        else { throw "atome_forward: unknown layer type '" + t + "'" }
+    }
+    return h
+}
+
+// tensor_argmax(logits) already gives the predicted class index (or one
+// per row for a batch) — this is just a readable name for that at the
+// model level, since "which class did this predict" comes up constantly.
+ton.function atome_predict_class(logitsTensor) {
+    return tensor_argmax(logitsTensor)
+}
+
+ton.function atome_params(model) {
+    ton.array all = []
+    for ton.layer in model["layers"] {
+        if layer["type"] == "dense" {
+            push(all, layer["W"])
+            push(all, layer["b"])
+        } else if layer["type"] == "conv1d" {
+            push(all, layer["K"])
+            push(all, layer["b"])
+        }
+    }
+    return all
+}
+
+ton.function atome_zero_grads(params) {
+    for ton.p in params { atome_zero_grad(p) }
+}
+
+ton.function atome_sgd_step(params, lr) {
+    for ton.p in params {
+        p["data"] = atome_tensor_sub(p["data"], atome_tensor_mul(p["grad"], lr))
+    }
+}
+
+// Adam optimizer (Kingma & Ba, 2014) — keeps a running first/second moment
+// estimate per parameter with bias correction. atome_adam_init returns an
+// opaque state dict; pass it to atome_adam_step once per training step
+// (after atome_backward, same as atome_sgd_step).
+ton.function atome_adam_init(params, lr) {
+    ton.array m = []
+    ton.array v = []
+    for ton.p in params {
+        push(m, atome_tensor_zeros(p["data"]["shape"]))
+        push(v, atome_tensor_zeros(p["data"]["shape"]))
+    }
+    return {params: params, m: m, v: v, lr: lr, beta1: 0.9, beta2: 0.999, eps: 0.00000001, t: 0}
+}
+
+ton.function atome_adam_step(opt) {
+    opt["t"] += 1
+    ton.int t = opt["t"]
+    ton.float lr = opt["lr"]
+    ton.float b1 = opt["beta1"]
+    ton.float b2 = opt["beta2"]
+    ton.float eps = opt["eps"]
+    ton.array params = opt["params"]
+    ton.array mArr = opt["m"]
+    ton.array vArr = opt["v"]
+    ton.float mHatScale = 1 / (1 - pow(b1, t))
+    ton.float vHatScale = 1 / (1 - pow(b2, t))
+    for ton.int i = 0; i < len(params); i++ {
+        ton.dict p = params[i]
+        ton.dict g = p["grad"]
+        ton.dict newM = atome_tensor_add(atome_tensor_mul(mArr[i], b1), atome_tensor_mul(g, 1 - b1))
+        ton.dict newV = atome_tensor_add(atome_tensor_mul(vArr[i], b2), atome_tensor_mul(atome_tensor_mul(g, g), 1 - b2))
+        mArr[i] = newM
+        vArr[i] = newV
+        ton.array mHatData = atome_tensor_mul(newM, mHatScale)["data"]
+        ton.array vHatData = atome_tensor_mul(newV, vHatScale)["data"]
+        ton.array updateData = []
+        for ton.int j = 0; j < len(mHatData); j++ { push(updateData, lr * mHatData[j] / (sqrt(vHatData[j]) + eps)) }
+        p["data"] = atome_tensor_sub(p["data"], {shape: p["data"]["shape"], data: updateData})
+    }
+}
+
+// =============================================================================
+// Model save/load — .atm files are just JSON (see the "Honest limits" note
+// in the README: this is a simple, real, human-readable format, not a novel
+// binary one).
+// =============================================================================
+
+ton.function atome_save(model, path) {
+    ton.array layersOut = []
+    for ton.layer in model["layers"] {
+        if layer["type"] == "dense" {
+            push(layersOut, {
+                type: "dense",
+                W: atome_tensor_to_array(layer["W"]["data"]),
+                b: atome_tensor_to_array(layer["b"]["data"])
+            })
+        } else {
+            push(layersOut, {type: layer["type"]})
+        }
+    }
+    ton.dict doc = {format: "atome-v1", layers: layersOut}
+    writefile(path, json_pretty(doc))
+}
+
+ton.function atome_load(path) {
+    ton.dict doc = json_parse(str(readfile(path)))
+    ton.array layers = []
+    for ton.layerDoc in doc["layers"] {
+        ton.string t = layerDoc["type"]
+        if t == "dense" {
+            ton.dict wNode = atome_node(atome_tensor_from_array(layerDoc["W"]))
+            ton.dict bNode = atome_node(atome_tensor_from_array(layerDoc["b"]))
+            push(layers, {type: "dense", W: wNode, b: bNode})
+        } else {
+            push(layers, {type: t})
+        }
+    }
+    return atome_sequential(layers)
+}
+
+// =============================================================================
+// Tokenizer — word-level (whitespace-split, lowercased), with a simple
+// frequency-based vocabulary. Not BPE — see the README for why, and for how
+// to plug in your own scheme if you need one.
+// =============================================================================
+
+ton.function atome__sort_pairs_desc(pairs) {
+    ton.int n = len(pairs)
+    for ton.int i = 1; i < n; i++ {
+        ton.array cur = pairs[i]
+        ton.int j = i - 1
+        while j >= 0 && pairs[j][1] < cur[1] {
+            pairs[j + 1] = pairs[j]
+            j -= 1
+        }
+        pairs[j + 1] = cur
+    }
+    return pairs
+}
+
+ton.function atome_tokenizer_fit(texts, maxVocabSize) {
+    ton.dict counts = {}
+    for ton.text in texts {
+        ton.array words = split(lower(text), " ")
+        for ton.w in words {
+            if w == "" { continue }
+            if has(counts, w) { counts[w] += 1 } else { counts[w] = 1 }
+        }
+    }
+    ton.array pairs = []
+    for ton.w in counts { push(pairs, [w, counts[w]]) }
+    atome__sort_pairs_desc(pairs)
+
+    ton.dict vocab = {}
+    ton.array idToToken = []
+    vocab["<UNK>"] = 0
+    push(idToToken, "<UNK>")
+    vocab["<PAD>"] = 1
+    push(idToToken, "<PAD>")
+
+    ton.int limit = maxVocabSize - 2
+    ton.int count = 0
+    for ton.pair in pairs {
+        if count >= limit { break }
+        vocab[pair[0]] = len(idToToken)
+        push(idToToken, pair[0])
+        count += 1
+    }
+    return {vocab: vocab, idToToken: idToToken}
+}
+
+ton.function atome_tokenize(tok, text) {
+    ton.array words = split(lower(text), " ")
+    ton.dict vocab = tok["vocab"]
+    ton.array ids = []
+    for ton.w in words {
+        if w == "" { continue }
+        if has(vocab, w) { push(ids, vocab[w]) } else { push(ids, vocab["<UNK>"]) }
+    }
+    return ids
+}
+
+ton.function atome_detokenize(tok, ids) {
+    ton.array idToToken = tok["idToToken"]
+    ton.array words = []
+    for ton.tid in ids { push(words, idToToken[tid]) }
+    return join(words, " ")
+}

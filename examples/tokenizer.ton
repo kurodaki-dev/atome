@@ -1,0 +1,18 @@
+IMPORT://atome
+
+ton.array corpus = [
+    "the cat sat on the mat",
+    "the dog sat on the log",
+    "cats and dogs are friends"
+]
+
+ton.dict tok = atome_tokenizer_fit(corpus, 20)
+print("vocabulary (most frequent first):")
+print(tok["idToToken"])
+
+ton.array ids = atome_tokenize(tok, "the cat sat on a rug")
+print("token ids for 'the cat sat on a rug':")
+print(ids)
+
+print("detokenized back:")
+print(atome_detokenize(tok, ids))

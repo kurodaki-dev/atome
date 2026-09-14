@@ -1,0 +1,25 @@
+// Trains nothing here — just demonstrates saving a model to a .atm file and
+// loading it back, and confirms the reloaded model runs identically.
+IMPORT://atome
+
+ton.dict model = atome_sequential([
+    atome_dense(2, 3),
+    atome_relu_layer(),
+    atome_dense(3, 1)
+])
+
+atome_save(model, "my_model.atm")
+print("saved to my_model.atm")
+
+ton.dict loaded = atome_load("my_model.atm")
+
+ton.dict x = atome_node(atome_tensor_from_array([[1, 2]]))
+ton.dict predBefore = atome_forward(model, x)
+
+ton.dict x2 = atome_node(atome_tensor_from_array([[1, 2]]))
+ton.dict predAfter = atome_forward(loaded, x2)
+
+print("original model output:")
+print(atome_tensor_to_array(predBefore["data"]))
+print("reloaded model output:")
+print(atome_tensor_to_array(predAfter["data"]))
