@@ -1,0 +1,42 @@
+// Trains a single Conv1D layer to learn the "discrete difference" operator
+// (target[i] = signal[i+1] - signal[i], i.e. the kernel [-1, 1]) purely
+// from examples — proof the layer actually learns, not just that its
+// gradient checks out numerically (see gradient_check.ton for that).
+IMPORT://atome
+IMPORT://ton.random
+
+random_seed(5)
+
+ton.function makeExample() {
+    ton.array sig = []
+    for ton.int i = 0; i < 8; i++ { push(sig, random() * 2 - 1) }
+    ton.array target = []
+    for ton.int i = 0; i < 7; i++ { push(target, sig[i + 1] - sig[i]) }
+    return [sig, target]
+}
+
+ton.dict layer = atome_conv1d(2, 1)
+ton.array params = [layer["K"], layer["b"]]
+ton.dict opt = atome_adam_init(params, 0.1)
+
+for ton.int step = 0; step < 300; step++ {
+    ton.array example = makeExample()
+    ton.dict signal = atome_tensor_from_array(example[0])
+    ton.dict target = atome_tensor_from_array(example[1])
+
+    atome_zero_grads(params)
+    ton.dict xNode = atome_node(signal)
+    ton.dict out = atome_conv1d_forward(layer, xNode)
+    ton.dict loss = atome_mse_loss(out, target)
+    atome_backward(loss)
+    atome_adam_step(opt)
+
+    if step % 50 == 0 {
+        print("step " + str(step) + " loss=" + str(loss["data"]["data"][0]))
+    }
+}
+
+print("learned kernel (expect close to [-1, 1]):")
+print(atome_tensor_to_array(layer["K"]["data"]))
+print("learned bias (expect close to 0):")
+print(atome_tensor_to_array(layer["b"]["data"]))

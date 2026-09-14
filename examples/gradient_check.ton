@@ -1,0 +1,79 @@
+// Numerical gradient check for atome_conv1d — the standard way to verify a
+// hand-derived backward pass is actually correct, not just "runs without
+// crashing": perturb each input by a tiny epsilon, see how much the loss
+// moves, and compare that to what atome_backward computed analytically.
+IMPORT://atome
+IMPORT://ton.random
+
+random_seed(123)
+
+ton.int signalLen = 10
+ton.int kernelSize = 3
+ton.int stride = 2
+
+ton.array sigArr = []
+for ton.int i = 0; i < signalLen; i++ { push(sigArr, random() * 2 - 1) }
+ton.dict signal = atome_tensor_from_array(sigArr)
+
+ton.dict layer = atome_conv1d(kernelSize, stride)
+ton.array target = []
+ton.dict probe = tensor_conv1d(signal, layer["K"]["data"], stride)
+for ton.v in probe["data"] { push(target, v + (random() * 2 - 1)) }
+ton.dict targetTensor = atome_tensor_from_array(target)
+
+ton.function computeLoss(sigTensor, kernelTensor) {
+    ton.dict xNode = atome_node(sigTensor)
+    ton.dict localLayer = {type: "conv1d", K: atome_node(kernelTensor), b: layer["b"], kernelSize: kernelSize, stride: stride}
+    ton.dict out = atome_conv1d_forward(localLayer, xNode)
+    ton.dict loss = atome_mse_loss(out, targetTensor)
+    return loss["data"]["data"][0]
+}
+
+// --- analytical gradients via atome_backward ---
+ton.dict xNode = atome_node(signal)
+atome_zero_grad(xNode)
+atome_zero_grad(layer["K"])
+atome_zero_grad(layer["b"])
+ton.dict out = atome_conv1d_forward(layer, xNode)
+ton.dict loss = atome_mse_loss(out, targetTensor)
+atome_backward(loss)
+
+ton.array analyticalSignalGrad = xNode["grad"]["data"]
+ton.array analyticalKernelGrad = layer["K"]["grad"]["data"]
+
+// --- numerical gradients via finite differences ---
+ton.float eps = 0.0001
+ton.float maxDiff = 0
+
+ton.array sigData = signal["data"]
+for ton.int i = 0; i < len(sigData); i++ {
+    ton.array plus = []
+    ton.array minus = []
+    for ton.int j = 0; j < len(sigData); j++ {
+        push(plus, sigData[j] + (i == j ? eps : 0))
+        push(minus, sigData[j] - (i == j ? eps : 0))
+    }
+    ton.float lossPlus = computeLoss(atome_tensor_from_array(plus), layer["K"]["data"])
+    ton.float lossMinus = computeLoss(atome_tensor_from_array(minus), layer["K"]["data"])
+    ton.float numGrad = (lossPlus - lossMinus) / (2 * eps)
+    ton.float diff = abs(numGrad - analyticalSignalGrad[i])
+    if diff > maxDiff { maxDiff = diff }
+}
+
+ton.array kerData = layer["K"]["data"]["data"]
+for ton.int i = 0; i < len(kerData); i++ {
+    ton.array plus = []
+    ton.array minus = []
+    for ton.int j = 0; j < len(kerData); j++ {
+        push(plus, kerData[j] + (i == j ? eps : 0))
+        push(minus, kerData[j] - (i == j ? eps : 0))
+    }
+    ton.float lossPlus = computeLoss(signal, atome_tensor_from_array(plus))
+    ton.float lossMinus = computeLoss(signal, atome_tensor_from_array(minus))
+    ton.float numGrad = (lossPlus - lossMinus) / (2 * eps)
+    ton.float diff = abs(numGrad - analyticalKernelGrad[i])
+    if diff > maxDiff { maxDiff = diff }
+}
+
+print("max |analytical - numerical| gradient difference: " + str(maxDiff))
+print(maxDiff < 0.001 ? "PASS: Conv1D backward matches the numerical gradient" : "FAIL: gradients do not match")

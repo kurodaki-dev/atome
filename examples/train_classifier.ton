@@ -1,0 +1,46 @@
+// Multi-class classification: 3 separable 2D clusters, trained with
+// softmax + cross-entropy loss and the Adam optimizer.
+IMPORT://atome
+IMPORT://ton.random
+
+random_seed(7)
+
+ton.array X = [
+    [0.1, 0.2], [-0.1, 0.1], [0.2, -0.1], [0.0, 0.15], [-0.15, -0.05], [0.05, 0.05],
+    [5.1, 5.2], [4.9, 5.1], [5.2, 4.9], [5.0, 5.15], [4.85, 4.95], [5.05, 5.05],
+    [0.1, 5.2], [-0.1, 5.1], [0.2, 4.9], [0.0, 5.15], [-0.15, 4.95], [0.05, 5.05]
+]
+ton.array labels = [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2]
+
+ton.dict Xt = atome_tensor_from_array(X)
+ton.dict Yt = atome_one_hot(labels, 3)
+
+ton.dict model = atome_sequential([
+    atome_dense(2, 16),
+    atome_tanh_layer(),
+    atome_dense(16, 3)
+])
+ton.array params = atome_params(model)
+ton.dict opt = atome_adam_init(params, 0.05)
+
+for ton.int epoch = 0; epoch < 300; epoch++ {
+    atome_zero_grads(params)
+    ton.dict logits = atome_forward(model, atome_node(Xt))
+    ton.dict loss = atome_softmax_cross_entropy_loss(logits, Yt)
+    atome_backward(loss)
+    atome_adam_step(opt)
+    if epoch % 50 == 0 {
+        print("epoch " + str(epoch) + " loss=" + str(loss["data"]["data"][0]))
+    }
+}
+
+ton.dict finalLogits = atome_forward(model, atome_node(Xt))
+ton.array probs = atome_tensor_to_array(atome_tensor_softmax(finalLogits["data"]))
+ton.int correct = 0
+for ton.int i = 0; i < len(probs); i++ {
+    ton.array row = probs[i]
+    ton.int best = 0
+    for ton.int c = 1; c < 3; c++ { if row[c] > row[best] { best = c } }
+    if best == labels[i] { correct += 1 }
+}
+print("accuracy: " + str(correct) + "/" + str(len(labels)))
