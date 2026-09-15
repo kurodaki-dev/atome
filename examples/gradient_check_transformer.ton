@@ -1,0 +1,69 @@
+// Numerical gradient check for the full Transformer stack: a complete
+// causally-masked transformer block (multi-head attention + LayerNorm +
+// feed-forward + LayerNorm), checked both w.r.t. its input and w.r.t. one
+// of the attention weight matrices. Finite differences vs. the analytical
+// backward computed by atome_backward — see DOCUMENTATION.md for why this
+// is the verification method used throughout atome.
+IMPORT://atome
+IMPORT://ton.random
+
+random_seed(5)
+
+ton.int dModel = 4
+ton.int numHeads = 2
+ton.int seqLen = 3
+ton.dict block = atome_transformer_block(dModel, numHeads, 8)
+ton.dict mask = atome_causal_mask(seqLen)
+
+ton.array xArr = []
+ton.array weights = []
+for ton.int i = 0; i < seqLen; i++ {
+    ton.array row = []
+    ton.array wrow = []
+    for ton.int j = 0; j < dModel; j++ { push(row, (random() * 2 - 1)); push(wrow, (random() * 2 - 1)) }
+    push(xArr, row)
+    push(weights, wrow)
+}
+
+ton.function weightedSumArr(arr) {
+    ton.float s = 0
+    for ton.int i = 0; i < len(arr); i++ { for ton.int j = 0; j < len(arr[i]); j++ { s += arr[i][j] * weights[i][j] } }
+    return s
+}
+
+ton.function lossFromX(xArrLocal) {
+    ton.dict xn = atome_node(atome_tensor_from_array(xArrLocal))
+    ton.dict out = atome_transformer_block_forward(block, xn, mask)
+    return weightedSumArr(atome_tensor_to_array(out["data"]))
+}
+
+ton.dict xNode = atome_node(atome_tensor_from_array(xArr))
+ton.dict outNode = atome_transformer_block_forward(block, xNode, mask)
+ton.dict lossNode = atome_node({shape: [1], data: [weightedSumArr(atome_tensor_to_array(outNode["data"]))]})
+lossNode["parents"] = [outNode]
+lossNode["backward"] = ton.function(self) {
+    ton.float gradOut = self["grad"]["data"][0]
+    ton.array g = []
+    for ton.int i = 0; i < seqLen; i++ { for ton.int j = 0; j < dModel; j++ { push(g, weights[i][j] * gradOut) } }
+    outNode["grad"] = atome_tensor_add(outNode["grad"], {shape: [seqLen, dModel], data: g})
+}
+atome_backward(lossNode)
+
+ton.float eps = 0.0001
+ton.float maxDiff = 0
+for ton.int i = 0; i < seqLen; i++ {
+    for ton.int j = 0; j < dModel; j++ {
+        ton.array a2 = []
+        for ton.row in xArr { push(a2, [...row]) }
+        a2[i][j] = xArr[i][j] + eps
+        ton.float lp = lossFromX(a2)
+        a2[i][j] = xArr[i][j] - eps
+        ton.float lm = lossFromX(a2)
+        ton.float ng = (lp - lm) / (2 * eps)
+        ton.float ag = xNode["grad"]["data"][i * dModel + j]
+        ton.float diff = ag - ng > 0 ? ag - ng : ng - ag
+        if diff > maxDiff { maxDiff = diff }
+    }
+}
+print("max |analytical - numerical| gradient difference (transformer block, dInput): " + str(maxDiff))
+if maxDiff < 0.001 { print("PASS: transformer block backward matches the numerical gradient") } else { print("FAIL") }

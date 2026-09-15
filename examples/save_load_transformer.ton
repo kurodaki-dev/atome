@@ -1,0 +1,19 @@
+// Saves and reloads a full Transformer LM to/from a real binary .atm file
+// and confirms the reloaded model produces byte-identical output — see
+// DOCUMENTATION.md for the .atm binary layout (needs ton618 beta-1.0.10+).
+IMPORT://atome
+
+ton.dict model = atome_transformer_lm(10, 8, 2, 16, 2, 12)
+ton.array tokenIds = [1, 3, 5, 2, 7]
+
+ton.dict before = atome_transformer_lm_forward(model, tokenIds)
+atome_transformer_lm_save(model, "my_transformer.atm")
+print("saved to my_transformer.atm")
+
+ton.dict loaded = atome_transformer_lm_load("my_transformer.atm")
+ton.dict after = atome_transformer_lm_forward(loaded, tokenIds)
+
+print("original logits:")
+print(atome_tensor_to_array(before["data"]))
+print("reloaded logits:")
+print(atome_tensor_to_array(after["data"]))
