@@ -1,20 +1,25 @@
 // atome.ton — a from-scratch, pure-TON618 tensors + autograd + neural
-// network module. No C++/interpreter changes needed: everything here is
-// plain TON618, installable like any other module (`ton618 install atome`
-// once published, or just drop this file in your project's modules/ folder
-// and `IMPORT://atome`).
+// network module: Dense/Conv1D/Dropout/LayerNorm/Embedding layers, a
+// multi-head-attention Transformer (causal, GPT-style language model
+// included), SGD/Adam, and real binary .atm model files. It's an ordinary
+// module, not a language feature: installable like any other
+// (`ton618 install atome` once published, or just drop this file in your
+// project's modules/ folder and `IMPORT://atome`). Requires ton618
+// beta-1.0.10+ (for the native ton.tensor module it builds on, including
+// tensor_to_bytes/tensor_from_bytes for .atm files).
 //
 // HONEST LIMITS — read this before building anything ambitious:
 //   - CPU only. There is no GPU backend to reach from TON618 — atome_set_device
 //     accepts "gpu" but always actually runs on CPU (see below).
-//   - 1D and 2D tensors only (vectors and matrices) — no 3D+ tensors.
+//   - 1D and 2D tensors only (vectors and matrices) — no 3D+ tensors, so
+//     attention has no batch dimension (one sequence per forward call).
 //   - No broadcasting beyond a scalar, except the one explicit exception
 //     (atome_add_bias) used by Dense layers.
 //   - This is a real, from-scratch reverse-mode autodiff engine (same idea
 //     as micrograd), not a reimplementation of PyTorch. It is slow compared
 //     to a compiled numeric library — every scalar op is an interpreted
-//     TON618 loop — fine for small models and learning, not for real-scale
-//     training.
+//     TON618 loop (or a native ton.tensor C++ loop for the heavy ops) —
+//     fine for small models and learning, not for real-scale training.
 //
 // Naming convention: every exported name is prefixed "atome_" (module
 // guide convention — see DOCUMENTATION.md > "Creating a TON618 module").
@@ -107,6 +112,8 @@ ton.function atome_tensor_relu(t) { return tensor_relu(t) }
 ton.function atome_tensor_sigmoid(t) { return tensor_sigmoid(t) }
 ton.function atome_tensor_tanh(t) { return tensor_tanh(t) }
 ton.function atome_tensor_softmax(t) { return tensor_softmax(t) }
+ton.function atome_tensor_to_bytes(t) { return tensor_to_bytes(t) }
+ton.function atome_tensor_from_bytes(bytes, shape) { return tensor_from_bytes(bytes, shape) }
 
 // Native gradient helpers (see ton.tensor's own docs for the exact
 // input/output convention) — used by the autograd section below instead of
@@ -252,6 +259,107 @@ ton.function atome_tanh(a) {
     return out
 }
 
+// =============================================================================
+// Attention building blocks — transpose, scale-by-constant, row-wise softmax,
+// and column-concat, each a Node op with its own backward. Multi-head
+// self-attention (below, in the Layers section) is built entirely out of
+// these plus atome_matmul/atome_add — no new native functions needed beyond
+// what ton.tensor already provides, since attention over a single sequence
+// is just 2D matmuls/softmax (rows = sequence positions, columns =
+// features), which ton.tensor already supports directly.
+// =============================================================================
+
+ton.function atome_transpose(a) {
+    ton.dict out = atome_node(atome_tensor_transpose(a["data"]))
+    out["parents"] = [a]
+    out["op"] = "transpose"
+    out["backward"] = ton.function(self) {
+        a["grad"] = atome_tensor_add(a["grad"], atome_tensor_transpose(self["grad"]))
+    }
+    return out
+}
+
+// Multiplies by a plain (non-trainable) scalar constant — used to scale
+// attention scores by 1/sqrt(headDim). Not to be confused with atome_mul,
+// which multiplies two Nodes together elementwise.
+ton.function atome_scale(a, k) {
+    ton.dict out = atome_node(atome_tensor_mul(a["data"], k))
+    out["parents"] = [a]
+    out["op"] = "scale"
+    out["backward"] = ton.function(self) {
+        a["grad"] = atome_tensor_add(a["grad"], atome_tensor_mul(self["grad"], k))
+    }
+    return out
+}
+
+// Row-wise softmax as a Node (tensor_softmax is row-wise for a 2D tensor —
+// see ton.tensor). The backward is the softmax Jacobian-vector product,
+// computed per row since ton.tensor has no per-row reduction: for a row with
+// output s and upstream gradient g, dInput_i = s_i * (g_i - dot(g, s)).
+ton.function atome_softmax(a) {
+    ton.dict outData = atome_tensor_softmax(a["data"])
+    ton.dict out = atome_node(outData)
+    out["parents"] = [a]
+    out["op"] = "softmax"
+    out["backward"] = ton.function(self) {
+        ton.array shape = outData["shape"]
+        ton.int rows = len(shape) == 2 ? shape[0] : 1
+        ton.int cols = len(shape) == 2 ? shape[1] : shape[0]
+        ton.array s = outData["data"]
+        ton.array g = self["grad"]["data"]
+        ton.array dIn = []
+        for ton.int r = 0; r < rows; r++ {
+            ton.float dot = 0
+            for ton.int c = 0; c < cols; c++ {
+                ton.int idx = r * cols + c
+                dot += g[idx] * s[idx]
+            }
+            for ton.int c = 0; c < cols; c++ {
+                ton.int idx = r * cols + c
+                push(dIn, s[idx] * (g[idx] - dot))
+            }
+        }
+        a["grad"] = atome_tensor_add(a["grad"], {shape: shape, data: dIn})
+    }
+    return out
+}
+
+// Concatenates 2D nodes side-by-side along columns (all must have the same
+// row count) — used to recombine per-head attention outputs into one
+// (seqLen, dModel) tensor. Backward just routes each column-slice of the
+// upstream gradient back to the matching parent — concatenation is linear,
+// so no calculus needed beyond "split the gradient the same way".
+ton.function atome_concat_cols(nodes) {
+    ton.array arrays = []
+    for ton.n in nodes { push(arrays, atome_tensor_to_array(n["data"])) }
+    ton.int rows = len(arrays[0])
+    ton.array widths = []
+    for ton.arr in arrays { push(widths, len(arr[0])) }
+
+    ton.array outRows = []
+    for ton.int r = 0; r < rows; r++ {
+        ton.array row = []
+        for ton.arr in arrays { for ton.v in arr[r] { push(row, v) } }
+        push(outRows, row)
+    }
+    ton.dict out = atome_node(atome_tensor_from_array(outRows))
+    out["parents"] = nodes
+    out["op"] = "concat_cols"
+    out["backward"] = ton.function(self) {
+        ton.array gradArr = atome_tensor_to_array(self["grad"])
+        ton.int offset = 0
+        for ton.int i = 0; i < len(nodes); i++ {
+            ton.int w = widths[i]
+            ton.array sliceRows = []
+            for ton.int r = 0; r < rows; r++ { push(sliceRows, slice(gradArr[r], offset, offset + w)) }
+            ton.dict n = nodes[i]
+            n["grad"] = atome_tensor_add(n["grad"], atome_tensor_from_array(sliceRows))
+            offset += w
+        }
+    }
+    return out
+}
+
 // Mean-squared-error loss. predNode.data and targetTensor must be the same shape.
 ton.function atome_mse_loss(predNode, targetTensor) {
     ton.dict diff = atome_tensor_sub(predNode["data"], targetTensor)
@@ -332,6 +440,131 @@ ton.function atome_dense_forward(layer, xNode) {
     return atome_add_bias(atome_matmul(xNode, layer["W"]), layer["b"])
 }
 
+// LayerNorm — normalizes each row (last-dim) of a 2D (seqLen, features) node
+// to zero mean / unit variance, then applies a learnable per-feature scale
+// (gamma) and shift (beta). Standard Transformer building block, used after
+// attention and after the feed-forward sublayer. The backward is the
+// well-known closed form for LayerNorm (derived by hand here, verified
+// against a numerical gradient check — see examples/gradient_check.ton);
+// it simplifies nicely because sum_i(x_i - mean) is exactly zero by
+// construction, which cancels one whole term of the general derivation.
+ton.function atome_layernorm(features) {
+    ton.array gammaArr = []
+    ton.array betaArr = []
+    for ton.int i = 0; i < features; i++ { push(gammaArr, 1); push(betaArr, 0) }
+    ton.dict gammaNode = atome_node({shape: [features], data: gammaArr})
+    ton.dict betaNode = atome_node({shape: [features], data: betaArr})
+    return {type: "layernorm", gamma: gammaNode, beta: betaNode, features: features, eps: 0.00001}
+}
+
+ton.function atome_layernorm_forward(layer, xNode) {
+    ton.dict gammaNode = layer["gamma"]
+    ton.dict betaNode = layer["beta"]
+    ton.int n = layer["features"]
+    ton.float eps = layer["eps"]
+    ton.array x = xNode["data"]["data"]
+    ton.array shape = xNode["data"]["shape"]
+    ton.int rows = shape[0]
+    ton.array gamma = gammaNode["data"]["data"]
+    ton.array beta = betaNode["data"]["data"]
+
+    ton.array means = []
+    ton.array stds = []
+    ton.array xhat = []
+    ton.array outArr = []
+    for ton.int r = 0; r < rows; r++ {
+        ton.float mu = 0
+        for ton.int c = 0; c < n; c++ { mu += x[r * n + c] }
+        mu /= n
+        ton.float varSum = 0
+        for ton.int c = 0; c < n; c++ { ton.float d = x[r * n + c] - mu; varSum += d * d }
+        ton.float variance = varSum / n
+        ton.float std = sqrt(variance + eps)
+        push(means, mu)
+        push(stds, std)
+        for ton.int c = 0; c < n; c++ {
+            ton.float xh = (x[r * n + c] - mu) / std
+            push(xhat, xh)
+            push(outArr, xh * gamma[c] + beta[c])
+        }
+    }
+
+    ton.dict out = atome_node({shape: shape, data: outArr})
+    out["parents"] = [xNode, gammaNode, betaNode]
+    out["op"] = "layernorm"
+    out["backward"] = ton.function(self) {
+        ton.array dy = self["grad"]["data"]
+        ton.array dGamma = []
+        ton.array dBeta = []
+        for ton.int c = 0; c < n; c++ { push(dGamma, 0); push(dBeta, 0) }
+        ton.array dx = []
+        for ton.int i = 0; i < len(x); i++ { push(dx, 0) }
+        for ton.int r = 0; r < rows; r++ {
+            ton.float std = stds[r]
+            ton.float sumDxhat = 0
+            ton.float sumDxhatXc = 0
+            for ton.int c = 0; c < n; c++ {
+                ton.int idx = r * n + c
+                ton.float dxh = dy[idx] * gamma[c]
+                dGamma[c] += dy[idx] * xhat[idx]
+                dBeta[c] += dy[idx]
+                sumDxhat += dxh
+                sumDxhatXc += dxh * (x[idx] - means[r])
+            }
+            ton.float dvar = -0.5 * sumDxhatXc / (std * std * std)
+            ton.float dmu = -sumDxhat / std
+            for ton.int c = 0; c < n; c++ {
+                ton.int idx = r * n + c
+                ton.float dxh = dy[idx] * gamma[c]
+                dx[idx] = dxh / std + (2.0 / n) * dvar * (x[idx] - means[r]) + dmu / n
+            }
+        }
+        xNode["grad"] = atome_tensor_add(xNode["grad"], {shape: shape, data: dx})
+        gammaNode["grad"] = atome_tensor_add(gammaNode["grad"], {shape: [n], data: dGamma})
+        betaNode["grad"] = atome_tensor_add(betaNode["grad"], {shape: [n], data: dBeta})
+    }
+    return out
+}
+
+// Embedding table — a trainable (vocabSize, dModel) lookup table. Forward
+// gathers one row per id in `ids` into a (len(ids), dModel) node; backward
+// scatters the upstream gradient back into the matching rows of the table's
+// own gradient, accumulating (with +=) when the same id appears more than
+// once, exactly like a real embedding layer's gradient.
+ton.function atome_embedding(vocabSize, dModel) {
+    ton.float scale = 1 / sqrt(dModel)
+    ton.array rows = []
+    for ton.int i = 0; i < vocabSize; i++ {
+        ton.array row = []
+        for ton.int j = 0; j < dModel; j++ { push(row, (random() * 2 - 1) * scale) }
+        push(rows, row)
+    }
+    ton.dict tableNode = atome_node(atome_tensor_from_array(rows))
+    return {type: "embedding", table: tableNode, vocabSize: vocabSize, dModel: dModel}
+}
+
+ton.function atome_embedding_forward(layer, ids) {
+    ton.dict tableNode = layer["table"]
+    ton.int dModel = layer["dModel"]
+    ton.array tableArr = atome_tensor_to_array(tableNode["data"])
+    ton.array outRows = []
+    for ton.tid in ids { push(outRows, tableArr[tid]) }
+
+    ton.dict out = atome_node(atome_tensor_from_array(outRows))
+    out["parents"] = [tableNode]
+    out["op"] = "embedding"
+    out["backward"] = ton.function(self) {
+        ton.array gradArr = atome_tensor_to_array(self["grad"])
+        ton.array tableGradArr = atome_tensor_to_array(tableNode["grad"])
+        for ton.int i = 0; i < len(ids); i++ {
+            ton.int tid = ids[i]
+            for ton.int j = 0; j < dModel; j++ { tableGradArr[tid][j] += gradArr[i][j] }
+        }
+        tableNode["grad"] = atome_tensor_from_array(tableGradArr)
+    }
+    return out
+}
+
 // Conv1D — single input channel, single output channel (no multi-channel
 // support — see the README/DOCUMENTATION for why that's the honest scope
 // here). Wraps the native tensor_conv1d primitive with a hand-derived,
@@ -381,6 +614,178 @@ ton.function atome_conv1d_forward(layer, xNode) {
         bias["grad"] = atome_tensor_add(bias["grad"], {shape: [1], data: [dBias]})
     }
     return out
+}
+
+// =============================================================================
+// Multi-head self-attention and Transformer blocks.
+//
+// ton.tensor is 2D-only (see its "Honest limits"), so there is no batch
+// dimension here: a single call processes one sequence at a time, as a
+// (seqLen, dModel) node — rows are sequence positions, columns are
+// features. That turns out to be exactly the shape multi-head attention
+// needs anyway: per head, Q/K/V are (seqLen, headDim), the attention matrix
+// Q @ K^T is (seqLen, seqLen), and softmax-over-each-row (already how
+// tensor_softmax works for 2D) is precisely "softmax over the attended
+// positions for each query position". So no 3D/4D tensor support is needed
+// at all — every op above (matmul, transpose, softmax, concat_cols) is a
+// plain 2D op. To process a batch of sequences, call the forward function
+// once per sequence in a TON618 loop.
+// =============================================================================
+
+// Builds an additive causal mask (seqLen, seqLen): 0 where a query position
+// may attend to a key position (on or before it), a large negative number
+// where it may not (strictly after it) — added to the raw attention scores
+// before softmax, which drives those entries' softmax weight to ~0 without
+// the numerical issues of an actual -infinity.
+ton.function atome_causal_mask(seqLen) {
+    ton.array rows = []
+    for ton.int i = 0; i < seqLen; i++ {
+        ton.array row = []
+        for ton.int j = 0; j < seqLen; j++ { push(row, j > i ? -1000000000 : 0) }
+        push(rows, row)
+    }
+    return atome_tensor_from_array(rows)
+}
+
+// dModel must be divisible by numHeads. No bias on the Q/K/V projections
+// (a common simplification — matches e.g. GPT-2's attention convention),
+// but the output projection Wo does have a bias, like a normal Dense layer.
+ton.function atome_multihead_attention(dModel, numHeads) {
+    if dModel % numHeads != 0 { throw "atome_multihead_attention: dModel must be divisible by numHeads" }
+    ton.int headDim = dModel / numHeads
+    ton.float scale = 1 / sqrt(dModel)
+    ton.array Wq = []
+    ton.array Wk = []
+    ton.array Wv = []
+    for ton.int h = 0; h < numHeads; h++ {
+        ton.array wqRows = []
+        ton.array wkRows = []
+        ton.array wvRows = []
+        for ton.int i = 0; i < dModel; i++ {
+            ton.array rq = []
+            ton.array rk = []
+            ton.array rv = []
+            for ton.int j = 0; j < headDim; j++ {
+                push(rq, (random() * 2 - 1) * scale)
+                push(rk, (random() * 2 - 1) * scale)
+                push(rv, (random() * 2 - 1) * scale)
+            }
+            push(wqRows, rq)
+            push(wkRows, rk)
+            push(wvRows, rv)
+        }
+        push(Wq, atome_node(atome_tensor_from_array(wqRows)))
+        push(Wk, atome_node(atome_tensor_from_array(wkRows)))
+        push(Wv, atome_node(atome_tensor_from_array(wvRows)))
+    }
+    ton.dict Wo = atome_dense(dModel, dModel)
+    return {type: "mha", numHeads: numHeads, headDim: headDim, dModel: dModel, Wq: Wq, Wk: Wk, Wv: Wv, Wo: Wo}
+}
+
+// mask (optional): an additive tensor from atome_causal_mask, or nil for
+// unmasked (bidirectional) attention.
+ton.function atome_multihead_attention_forward(layer, xNode, mask = nil) {
+    ton.int numHeads = layer["numHeads"]
+    ton.int headDim = layer["headDim"]
+    ton.float invSqrtHeadDim = 1 / sqrt(headDim)
+    ton.array contexts = []
+    for ton.int h = 0; h < numHeads; h++ {
+        ton.dict Qh = atome_matmul(xNode, layer["Wq"][h])
+        ton.dict Kh = atome_matmul(xNode, layer["Wk"][h])
+        ton.dict Vh = atome_matmul(xNode, layer["Wv"][h])
+        ton.dict scores = atome_scale(atome_matmul(Qh, atome_transpose(Kh)), invSqrtHeadDim)
+        if mask != nil {
+            ton.dict maskNode = atome_node(mask)
+            scores = atome_add(scores, maskNode)
+        }
+        ton.dict attn = atome_softmax(scores)
+        push(contexts, atome_matmul(attn, Vh))
+    }
+    ton.dict concat = atome_concat_cols(contexts)
+    return atome_dense_forward(layer["Wo"], concat)
+}
+
+ton.function atome_transformer_block(dModel, numHeads, dFF) {
+    return {
+        type: "transformer_block",
+        mha: atome_multihead_attention(dModel, numHeads),
+        ln1: atome_layernorm(dModel),
+        ffn1: atome_dense(dModel, dFF),
+        ffn2: atome_dense(dFF, dModel),
+        ln2: atome_layernorm(dModel)
+    }
+}
+
+// Classic post-norm Transformer block: LN(x + Sublayer(x)) for both the
+// attention and feed-forward sublayers.
+ton.function atome_transformer_block_forward(block, xNode, mask = nil) {
+    ton.dict attnOut = atome_multihead_attention_forward(block["mha"], xNode, mask)
+    ton.dict norm1 = atome_layernorm_forward(block["ln1"], atome_add(xNode, attnOut))
+    ton.dict ffnOut = atome_dense_forward(block["ffn2"], atome_relu(atome_dense_forward(block["ffn1"], norm1)))
+    return atome_layernorm_forward(block["ln2"], atome_add(norm1, ffnOut))
+}
+
+// A small decoder-only (GPT-style) Transformer language model: token
+// embedding + learned positional embedding, N causally-masked Transformer
+// blocks, then a Dense projection to vocabulary-sized logits. Call
+// atome_transformer_lm_forward with a plain array of token ids for one
+// sequence (not a batch — see the note above); it returns a
+// (seqLen, vocabSize) node of raw logits, ready for
+// atome_softmax_cross_entropy_loss or atome_predict_class per row.
+ton.function atome_transformer_lm(vocabSize, dModel, numHeads, dFF, numLayers, maxSeqLen) {
+    ton.array blocks = []
+    for ton.int i = 0; i < numLayers; i++ { push(blocks, atome_transformer_block(dModel, numHeads, dFF)) }
+    return {
+        type: "transformer_lm",
+        vocabSize: vocabSize,
+        dModel: dModel,
+        numHeads: numHeads,
+        dFF: dFF,
+        numLayers: numLayers,
+        maxSeqLen: maxSeqLen,
+        tokEmb: atome_embedding(vocabSize, dModel),
+        posEmb: atome_embedding(maxSeqLen, dModel),
+        blocks: blocks,
+        outProj: atome_dense(dModel, vocabSize)
+    }
+}
+
+ton.function atome_transformer_lm_forward(model, tokenIds) {
+    ton.int seqLen = len(tokenIds)
+    if seqLen > model["maxSeqLen"] { throw "atome_transformer_lm_forward: sequence length exceeds maxSeqLen" }
+    ton.array positions = []
+    for ton.int i = 0; i < seqLen; i++ { push(positions, i) }
+    ton.dict tok = atome_embedding_forward(model["tokEmb"], tokenIds)
+    ton.dict pos = atome_embedding_forward(model["posEmb"], positions)
+    ton.dict x = atome_add(tok, pos)
+    ton.dict mask = atome_causal_mask(seqLen)
+    for ton.block in model["blocks"] { x = atome_transformer_block_forward(block, x, mask) }
+    return atome_dense_forward(model["outProj"], x)
+}
+
+ton.function atome_transformer_lm_params(model) {
+    ton.array all = []
+    push(all, model["tokEmb"]["table"])
+    push(all, model["posEmb"]["table"])
+    for ton.block in model["blocks"] {
+        ton.dict mha = block["mha"]
+        for ton.w in mha["Wq"] { push(all, w) }
+        for ton.w in mha["Wk"] { push(all, w) }
+        for ton.w in mha["Wv"] { push(all, w) }
+        push(all, mha["Wo"]["W"])
+        push(all, mha["Wo"]["b"])
+        push(all, block["ln1"]["gamma"])
+        push(all, block["ln1"]["beta"])
+        push(all, block["ffn1"]["W"])
+        push(all, block["ffn1"]["b"])
+        push(all, block["ffn2"]["W"])
+        push(all, block["ffn2"]["b"])
+        push(all, block["ln2"]["gamma"])
+        push(all, block["ln2"]["beta"])
+    }
+    push(all, model["outProj"]["W"])
+    push(all, model["outProj"]["b"])
+    return all
 }
 
 ton.function atome_relu_layer() { return {type: "relu"} }
@@ -512,42 +917,130 @@ ton.function atome_adam_step(opt) {
 }
 
 // =============================================================================
-// Model save/load — .atm files are just JSON (see the "Honest limits" note
-// in the README: this is a simple, real, human-readable format, not a novel
-// binary one).
+// Model save/load — .atm files are now a real binary format (ton618
+// beta-1.0.10+): an 8-byte header length, a compact JSON header describing
+// the architecture (layer types/sizes — never weight values), then every
+// trainable tensor's raw bytes concatenated in a fixed order, via
+// tensor_to_bytes/tensor_from_bytes. That's what a real framework's model
+// file looks like too (a small metadata index + a raw tensor-data blob) —
+// unlike the old all-JSON format, this has zero precision loss and a
+// smaller file, since numbers are 8 real bytes instead of ~10+ text
+// characters each. See DOCUMENTATION.md for the exact layout if you need to
+// read a .atm file from something other than atome itself.
 // =============================================================================
+
+// Writes `headerObj` (as compact JSON) followed by `blobsInOrder` (an array
+// of raw-bytes strings, each from tensor_to_bytes) to one binary file.
+ton.function atome__write_binary_model(path, headerObj, blobsInOrder) {
+    ton.string headerJson = json(headerObj)
+    ton.string blob = ""
+    for ton.b in blobsInOrder { blob += b }
+    ton.string lenPrefix = tensor_to_bytes({shape: [1], data: [len(headerJson)]})
+    writefile(path, lenPrefix + headerJson + blob)
+}
+
+// Reads a file written by atome__write_binary_model back into
+// {header: <parsed JSON>, body: <remaining raw bytes after the header>}.
+ton.function atome__read_binary_model(path) {
+    ton.string content = str(readfile(path))
+    ton.string lenPrefix = substring(content, 0, 8)
+    ton.int headerLen = tensor_from_bytes(lenPrefix, [1])["data"][0]
+    ton.string headerJson = substring(content, 8, headerLen)
+    ton.string body = substring(content, 8 + headerLen)
+    return {header: json_parse(headerJson), body: body}
+}
+
+// Pulls the next `n`-element tensor's worth of raw bytes off the front of
+// `state.body` (a {body: ...} dict passed by reference so this can be
+// called repeatedly to walk through the blob in order), returning a tensor
+// of the given shape.
+ton.function atome__take_tensor_bytes(state, shape) {
+    ton.int n = atome_tensor_size(shape)
+    ton.int byteLen = n * 8
+    ton.string chunk = substring(state["body"], 0, byteLen)
+    state["body"] = substring(state["body"], byteLen)
+    return tensor_from_bytes(chunk, shape)
+}
 
 ton.function atome_save(model, path) {
     ton.array layersOut = []
+    ton.array blobs = []
     for ton.layer in model["layers"] {
-        if layer["type"] == "dense" {
-            push(layersOut, {
-                type: "dense",
-                W: atome_tensor_to_array(layer["W"]["data"]),
-                b: atome_tensor_to_array(layer["b"]["data"])
-            })
+        ton.string t = layer["type"]
+        if t == "dense" {
+            push(layersOut, {type: "dense", inFeatures: layer["W"]["data"]["shape"][0], outFeatures: layer["W"]["data"]["shape"][1]})
+            push(blobs, tensor_to_bytes(layer["W"]["data"]))
+            push(blobs, tensor_to_bytes(layer["b"]["data"]))
+        } else if t == "conv1d" {
+            push(layersOut, {type: "conv1d", kernelSize: layer["kernelSize"], stride: layer["stride"]})
+            push(blobs, tensor_to_bytes(layer["K"]["data"]))
+            push(blobs, tensor_to_bytes(layer["b"]["data"]))
+        } else if t == "dropout" {
+            push(layersOut, {type: "dropout", p: layer["p"]})
         } else {
-            push(layersOut, {type: layer["type"]})
+            push(layersOut, {type: t})
         }
     }
-    ton.dict doc = {format: "atome-v1", layers: layersOut}
-    writefile(path, json_pretty(doc))
+    atome__write_binary_model(path, {format: "atome-bin-v1", kind: "sequential", layers: layersOut}, blobs)
 }
 
 ton.function atome_load(path) {
-    ton.dict doc = json_parse(str(readfile(path)))
+    ton.dict loaded = atome__read_binary_model(path)
+    ton.dict state = {body: loaded["body"]}
     ton.array layers = []
-    for ton.layerDoc in doc["layers"] {
+    for ton.layerDoc in loaded["header"]["layers"] {
         ton.string t = layerDoc["type"]
         if t == "dense" {
-            ton.dict wNode = atome_node(atome_tensor_from_array(layerDoc["W"]))
-            ton.dict bNode = atome_node(atome_tensor_from_array(layerDoc["b"]))
+            ton.int inF = layerDoc["inFeatures"]
+            ton.int outF = layerDoc["outFeatures"]
+            ton.dict wNode = atome_node(atome__take_tensor_bytes(state, [inF, outF]))
+            ton.dict bNode = atome_node(atome__take_tensor_bytes(state, [outF]))
             push(layers, {type: "dense", W: wNode, b: bNode})
+        } else if t == "conv1d" {
+            ton.int k = layerDoc["kernelSize"]
+            ton.dict kNode = atome_node(atome__take_tensor_bytes(state, [k]))
+            ton.dict bNode = atome_node(atome__take_tensor_bytes(state, [1]))
+            push(layers, {type: "conv1d", K: kNode, b: bNode, kernelSize: k, stride: layerDoc["stride"]})
+        } else if t == "dropout" {
+            push(layers, {type: "dropout", p: layerDoc["p"]})
         } else {
             push(layers, {type: t})
         }
     }
     return atome_sequential(layers)
+}
+
+// Save/load for a full atome_transformer_lm. The architecture is entirely
+// determined by six hyperparameters, so the header only needs those —
+// loading rebuilds a fresh model with atome_transformer_lm(...) (same
+// shapes, different random init) and then overwrites every parameter, in
+// the same order atome_transformer_lm_params returns them, with the loaded
+// bytes.
+ton.function atome_transformer_lm_save(model, path) {
+    ton.array blobs = []
+    for ton.p in atome_transformer_lm_params(model) { push(blobs, tensor_to_bytes(p["data"])) }
+    ton.dict headerObj = {
+        format: "atome-bin-v1",
+        kind: "transformer_lm",
+        vocabSize: model["vocabSize"],
+        dModel: model["dModel"],
+        numHeads: model["numHeads"],
+        dFF: model["dFF"],
+        numLayers: model["numLayers"],
+        maxSeqLen: model["maxSeqLen"]
+    }
+    atome__write_binary_model(path, headerObj, blobs)
+}
+
+ton.function atome_transformer_lm_load(path) {
+    ton.dict loaded = atome__read_binary_model(path)
+    ton.dict h = loaded["header"]
+    ton.dict model = atome_transformer_lm(h["vocabSize"], h["dModel"], h["numHeads"], h["dFF"], h["numLayers"], h["maxSeqLen"])
+    ton.dict state = {body: loaded["body"]}
+    for ton.p in atome_transformer_lm_params(model) {
+        p["data"] = atome__take_tensor_bytes(state, p["data"]["shape"])
+    }
+    return model
 }
 
 // =============================================================================

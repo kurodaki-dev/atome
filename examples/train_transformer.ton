@@ -1,0 +1,60 @@
+// Trains a small decoder-only (GPT-style) causal Transformer to predict the
+// next character in a repeating "abcdefgh" cycle. There's an exact,
+// deterministic right answer for every position, so this is a strong
+// end-to-end sanity check: if attention, layer norm, the feed-forward
+// sublayer, and Adam are all wired correctly together, the model should
+// reach (near-)perfect accuracy quickly.
+IMPORT://atome
+IMPORT://ton.random
+
+random_seed(7)
+
+ton.string alphabet = "abcdefgh"
+ton.int vocabSize = len(alphabet)
+ton.string fullSeq = ""
+for ton.int i = 0; i < 20; i++ { fullSeq += alphabet }
+ton.int fullLen = len(fullSeq)
+
+ton.function charToId(c) {
+    for ton.int i = 0; i < vocabSize; i++ { if alphabet[i] == c { return i } }
+    throw "unknown char"
+}
+
+ton.array fullIds = []
+for ton.int i = 0; i < fullLen; i++ { push(fullIds, charToId(fullSeq[i])) }
+
+ton.int seqLen = 16
+ton.dict model = atome_transformer_lm(vocabSize, 16, 2, 32, 2, seqLen)
+ton.array params = atome_transformer_lm_params(model)
+ton.dict opt = atome_adam_init(params, 0.01)
+
+ton.function sampleWindow() {
+    ton.int start = floor(random() * (fullLen - seqLen - 1))
+    ton.array inputIds = []
+    ton.array targetIds = []
+    for ton.int i = 0; i < seqLen; i++ {
+        push(inputIds, fullIds[start + i])
+        push(targetIds, fullIds[start + i + 1])
+    }
+    return {input: inputIds, target: targetIds}
+}
+
+for ton.int epoch = 0; epoch < 400; epoch++ {
+    ton.dict batch = sampleWindow()
+    atome_zero_grads(params)
+    ton.dict logits = atome_transformer_lm_forward(model, batch["input"])
+    ton.dict loss = atome_softmax_cross_entropy_loss(logits, atome_one_hot(batch["target"], vocabSize))
+    atome_backward(loss)
+    atome_adam_step(opt)
+    if epoch % 100 == 0 { print("epoch " + str(epoch) + " loss=" + str(loss["data"]["data"][0])) }
+}
+
+ton.dict evalBatch = sampleWindow()
+ton.dict evalLogits = atome_transformer_lm_forward(model, evalBatch["input"])
+ton.array preds = atome_predict_class(evalLogits["data"])
+ton.int correct = 0
+for ton.int i = 0; i < seqLen; i++ { if preds[i] == evalBatch["target"][i] { correct += 1 } }
+
+print("eval accuracy: " + str(correct) + "/" + str(seqLen))
+print("predicted: " + join(preds, ","))
+print("target:    " + join(evalBatch["target"], ","))
